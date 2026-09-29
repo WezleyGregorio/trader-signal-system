@@ -1,0 +1,176 @@
+      }
+    });
+
+    resizeObserver.observe(chartContainerRef.current);
+
+    // Initial size
+    if (chartContainerRef.current) {
+      const { clientWidth, clientHeight } = chartContainerRef.current;
+      if (clientWidth > 0 && clientHeight > 0) {
+        chart.applyOptions({ width: clientWidth, height: clientHeight });
+      }
+    }
+
+    return () => {
+      resizeObserver.disconnect();
+      chart.remove();
+      markersPluginRef.current = null;
+    };
+  }, []);
+
+  // Update Data and Zones when props change
+  useEffect(() => {
+    if (!seriesRef.current || !candles.length) return;
+
+    if (pulseIntervalRef.current) {
+      clearInterval(pulseIntervalRef.current);
+      pulseIntervalRef.current = null;
+    }
+
+    // Make sure timestamps are in increasing order and no duplicates, and filter out invalid/corrupt candles
+    const sortedCandles = [...candles]
+      .filter(c => c && typeof c.close === 'number' && c.close > 0 && typeof c.timestamp === 'number')
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .map(c => {
+        return {
+          time: Math.floor(c.timestamp / 1000) as any,
+          open: typeof c.open === 'number' && c.open > 0 ? c.open : c.close,
+          high: typeof c.high === 'number' && c.high > 0 ? c.high : c.close,
+          low: typeof c.low === 'number' && c.low > 0 ? c.low : c.close,
+          close: c.close,
+          volume: typeof c.volume === 'number' && c.volume >= 0 ? c.volume : 0,
+        };
+      });
+
+    // Remove duplicates based on time
+    const uniqueCandles: any[] = [];
+    const seenTimes = new Set();
+    for (const c of sortedCandles) {
+        if (!seenTimes.has(c.time)) {
+            seenTimes.add(c.time);
+            uniqueCandles.push(c);
+        }
+    }
+
+    try {
+        seriesRef.current.setData(uniqueCandles);
+        
+        // EMA 200 setup
+        const emaData = calculateEMA(uniqueCandles, 200);
+        emaSeriesRef.current.setData(emaData);
+
+        // Volume Overlay setup
+        if (volumeSeriesRef.current) {
+          const volumeData = uniqueCandles.map(c => {
+            const bullish = c.close >= c.open;
+            return {
+              time: c.time,
+              value: c.volume || 10,
+              color: bullish ? 'rgba(14, 203, 129, 0.28)' : 'rgba(246, 70, 93, 0.28)',
+            };
+          });
+          volumeSeriesRef.current.setData(volumeData);
+        }
+    } catch (e) {
+        console.warn("Could not set chart data", e);
+    }
+
+    // Clear old price lines
+    priceLinesRef.current.forEach(line => {
+      try {
+        seriesRef.current?.removePriceLine(line);
+      } catch (e) {
+        // Ignore if already removed
+      }
+    });
+    priceLinesRef.current = [];
+
+    // Add new zones as price lines
+    zones.forEach(zone => {
+      const isSupport = zone.type === 'SUPPORT';
+      const baseColor = isSupport ? '14, 203, 129' : '246, 70, 93';
+      const color = `rgba(${baseColor}, 0.4)`;
+      
+      const priceLineOptions: PriceLineOptions = {
+        price: zone.price,
+        color: color,
+        lineWidth: zone.isOrderBlock ? 2 : 1,
+        lineStyle: zone.isOrderBlock ? LineStyle.Solid : LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: `${isSupport ? 'SUP' : 'RES'}${zone.isOrderBlock ? ' OB' : ''} $${zone.price.toLocaleString(undefined, { maximumFractionDigits: 1 })}`,
+        lineVisible: true,
+        axisLabelColor: color,
+        axisLabelTextColor: '#ffffff',
+      };
+
+      try {
+        const prLine = seriesRef.current?.createPriceLine(priceLineOptions);
+        if (prLine) {
+          priceLinesRef.current.push(prLine);
+        }
+      } catch (e) {
+        console.warn("Could not create price line", e);
+      }
+    });
+
+    // Add markers for Signals
+    const markers: SeriesMarker<Time>[] = [];
+    const usedTimes = new Set<number>();
+    
+    // Sort signals by time
+    const sortedSignals = [...signals].sort((a, b) => a.timestamp - b.timestamp);
+    
+    // Create a set of valid candle times for quick lookup
+    const validCandleTimes = sortedCandles.map(c => c.time as number);
+    
+    for (const sig of sortedSignals) {
+      const tfMs = sig.timeframe === 'M15' ? 900000 : sig.timeframe === 'M5' ? 300000 : 60000;
+      let sigTime = Math.floor((sig.expiryTimestamp - tfMs) / 1000);
+      
+      // Fallback: If the exact candle time isn't found (e.g. gap in data), snap to nearest
+      if (!validCandleTimes.includes(sigTime) && validCandleTimes.length > 0) {
+        let closest = validCandleTimes[0];
+        let minDiff = Math.abs(closest - sigTime);
+        for (const t of validCandleTimes) {
+          const diff = Math.abs(t - sigTime);
+          if (diff < minDiff) {
+            minDiff = diff;
+            closest = t;
+          }
+        }
+        sigTime = closest;
+      }
+      
+      // Lightweight charts only allows one marker per time
+      if (usedTimes.has(sigTime)) continue;
+      usedTimes.add(sigTime);
+      
+      let formattedPrice = sig.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 5 });
+      let text = `${sig.type === 'CALL' ? 'CALL' : 'PUT'} @ ${formattedPrice}`;
+      
+      // Match signal with zone to get wins/losses count
+      const matchingZone = zones.find(z => Math.abs(z.price - sig.price) / z.price < 0.001);
+      
+      if (sig.status === 'WIN') {
+        text += ' (WIN)';
+        if (matchingZone && matchingZone.wins > 0) {
+          text += ` 🏆 ${matchingZone.wins}`;
+        }
+      } else if (sig.status === 'LOSS') {
+        text += ' (LOSS)';
+        if (matchingZone && matchingZone.losses > 0) {
+          text += ` 💀 ${matchingZone.losses}`;
+        }
+      } else {
+        text += ' (PENDING)';
+      }
+
+      let markerColor = sig.type === 'CALL' ? '#10b981' : '#f43f5e';
+
+      markers.push({
+        time: sigTime as any,
+        position: sig.type === 'CALL' ? 'belowBar' : 'aboveBar',
+        color: markerColor,
+        shape: sig.type === 'CALL' ? 'arrowUp' : 'arrowDown',
+        text: text,
+      });
