@@ -1,5 +1,0 @@
-{
-  "name": "Trader Signal System",
-  "description": "Sistema de sinais baseado em Price Action",
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
